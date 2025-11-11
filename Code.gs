@@ -1,0 +1,311 @@
+// --- PROPRIETÀ GLOBALI ---
+let PROPS;
+let TELEGRAM_TOKEN;
+let GEMINI_API_KEY;
+let SHEET_ID;
+let SHEET_TAB_NAME; // Nome del foglio log, es. "Log Attività"
+let SPREADSHEET;
+
+const LOG_SHEET_NAME = "Log Attività"; 
+const QUEUE_SHEET_NAME = "Queue";     
+const GEMINI_MODEL = "gemini-2.5-flash";
+const CACHE = CacheService.getScriptCache();
+
+// --- FUNZIONE WEBHOOK (VELOCE) - SENZA TRY/CATCH ---
+
+function doPost(e) {
+
+  const update = JSON.parse(e.postData.contents);
+
+  // 1. Controllo Idempotenza (Fondamentale)
+  const update_id = update.update_id;
+  if (update_id) {
+    if (CACHE.get(String(update_id))) {
+      return ContentService.createTextOutput(JSON.stringify({ "status": "ok_duplicate" })).setMimeType(ContentService.MimeType.JSON);
+    }
+    CACHE.put(String(update_id), 'processed', 600); 
+  }
+
+  // 2. Gestisci solo messaggi vocali
+  if (update.message && update.message.voice) {
+    const chat_id = update.message.chat.id;
+    const file_id = update.message.voice.file_id;
+    
+    // Caricamento proprietà essenziali
+    const PROPS = PropertiesService.getScriptProperties();
+    const SHEET_ID = PROPS.getProperty("SHEET_ID");
+    const SPREADSHEET = SpreadsheetApp.openById(SHEET_ID);
+    const queueSheet = SPREADSHEET.getSheetByName(QUEUE_SHEET_NAME);
+
+    // 3. Aggiungi alla coda (Se Sheets è lento, questo potrebbe fallire)
+    queueSheet.appendRow([ new Date(), chat_id, file_id, "NEW", "" ]);
+
+  } else if (update.message && update.message.text) {
+    // Rispondi ai messaggi di testo
+    if(!TELEGRAM_TOKEN) loadScriptProperties();
+    sendTelegramMessage(update.message.chat.id, "Non ho capito. Inviami solo messaggi vocali.");
+  }
+  
+  // 4. Restituisci 200 OK a Telegram
+  return ContentService.createTextOutput(JSON.stringify({ "status": "ok_queued" })).setMimeType(ContentService.MimeType.JSON);
+}
+
+
+// --- FUNZIONE WORKER (LENTA) - SENZA TRY/CATCH ---
+
+function processQueue() {
+  // --- 1. RE-INTRODUCIAMO IL LOCKSERVICE ---
+  // Tenta di ottenere un blocco per 10 secondi. Se fallisce, 
+  // significa che un altro operaio è già al lavoro.
+  const LOCK = LockService.getScriptLock();
+  if (!LOCK.tryLock(10000)) {
+    Logger.log("Esecuzione saltata: processo già in corso (Lock attivo).");
+    return;
+  }
+
+  try {
+    // 2. Carica le proprietà
+    loadScriptProperties();
+    const queueSheet = SPREADSHEET.getSheetByName(QUEUE_SHEET_NAME);
+    const dataRange = queueSheet.getDataRange();
+    const values = dataRange.getValues();
+
+    // 3. Cerca il primo task "NEW"
+    for (let i = 1; i < values.length; i++) {
+      const row = values[i];
+      const stato = row[3]; 
+
+      if (stato === "NEW") {
+        const rowNum = i + 1; 
+        const chat_id = row[1];
+        const file_id = row[2];
+
+        // --- 2. RE-INTRODUCIAMO IL TRY/CATCH (ESSENZIALE) ---
+        // Questo cattura gli errori (Timeout, 503, 400) e 
+        // impedisce che la riga resti bloccata in "PROCESSING".
+        try {
+          queueSheet.getRange(rowNum, 4).setValue("PROCESSING");
+          
+          Logger.log(`Processing riga ${rowNum}: chat_id ${chat_id}`);
+          const audioBlob = getTelegramFile(file_id);
+          const jsonString = callGeminiForJson(audioBlob, "audio/ogg");
+          
+          if (!jsonString || jsonString.trim() === "") {
+             throw new Error("Gemini ha restituito dati JSON vuoti.");
+          }
+
+          // Usiamo la V15.1 che aggiunge la data
+          const rowsAdded = appendJsonToSheet(jsonString);
+          
+          queueSheet.getRange(rowNum, 4).setValue("DONE");
+          queueSheet.getRange(rowNum, 5).setValue(`Aggiunte ${rowsAdded} righe.`);
+          
+          const sheetUrl = SPREADSHEET.getUrl();
+          sendTelegramMessage(chat_id, `Fatto! Ho aggiunto ${rowsAdded} attività al tuo log.\nPuoi vederle qui: ${sheetUrl}`);
+          
+          break; // Processa solo una riga alla volta
+
+        } catch (err) {
+          // --- GESTIONE ERRORI INTELLIGENTE ---
+          const errorMessage = err.message;
+          Logger.log(`ERRORE riga ${rowNum}: ${errorMessage}`);
+          
+          // Se l'errore è un Timeout di Google (che appare come "superato il tempo massimo")
+          if (errorMessage.includes("secondi") || errorMessage.includes("timeout") || errorMessage.includes("Execution timed out")) {
+              queueSheet.getRange(rowNum, 4).setValue("ERROR");
+              queueSheet.getRange(rowNum, 5).setValue("Timeout 6 minuti. Il file audio è troppo lungo per Gemini?");
+              sendTelegramMessage(chat_id, `Errore: L'analisi del tuo audio ha superato il tempo massimo di 6 minuti. Prova con un vocale più corto.`);
+          
+          } else if (errorMessage.includes("503") || errorMessage.includes("UNAVAILABLE") || errorMessage.includes("overloaded")) {
+            // Gemini sovraccarico, riprova
+            const noteCell = queueSheet.getRange(rowNum, 5);
+            const currentNote = noteCell.getValue();
+            const retryMessage = "In attesa (Gemini sovraccarico). Riprovo tra 1 min.";
+            if (currentNote !== retryMessage) {
+              sendTelegramMessage(chat_id, "ℹ️ Gemini (l'AI) è temporaneamente sovraccarico. Il tuo audio è in attesa, riproverò automaticamente tra 1 minuto.");
+            }
+            queueSheet.getRange(rowNum, 4).setValue("NEW"); 
+            noteCell.setValue(retryMessage);
+          
+          } else {
+            // Errore permanente (400, 500, ecc.)
+            queueSheet.getRange(rowNum, 4).setValue("ERROR");
+            queueSheet.getRange(rowNum, 5).setValue(errorMessage);
+            sendTelegramMessage(chat_id, `Si è verificato un errore permanente durante l'analisi: ${errorMessage}`);
+          }
+          // --- FINE GESTIONE ERRORI ---
+        }
+      }
+    }
+  } catch (err_esterno) {
+    // Questo cattura solo errori catastrofici (es. Foglio 'Queue' non trovato)
+    Logger.log("ERRORE GRAVE in processQueue: " + err_esterno.toString());
+  } finally {
+    // --- 3. RILASCIA IL LOCK ---
+    // Questo è fondamentale: rilascia il blocco alla fine, 
+    // sia che lo script abbia successo o fallisca.
+    LOCK.releaseLock();
+  }
+}
+
+
+// --- FUNZIONI HELPER (INVARIATE, LANCIANO GIÀ ERRORI) ---
+
+function loadScriptProperties() {
+  if (!PROPS) {
+    PROPS = PropertiesService.getScriptProperties();
+    TELEGRAM_TOKEN = PROPS.getProperty("TELEGRAM_TOKEN");
+    GEMINI_API_KEY = PROPS.getProperty("GEMINI_API_KEY");
+    SHEET_ID = PROPS.getProperty("SHEET_ID");
+    SHEET_TAB_NAME = LOG_SHEET_NAME; 
+    
+    if (!TELEGRAM_TOKEN || !GEMINI_API_KEY || !SHEET_ID || !SHEET_TAB_NAME) {
+        throw new Error("Una o più Proprietà Script (TOKEN, KEY, ID) non sono impostate.");
+    }
+    SPREADSHEET = SpreadsheetApp.openById(SHEET_ID);
+    if (!SPREADSHEET) {
+        throw new Error("Impossibile aprire Spreadsheet con ID: " + SHEET_ID);
+    }
+  }
+}
+
+function sendTelegramMessage(chat_id, text) {
+  if (!TELEGRAM_TOKEN) loadScriptProperties();
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+  const payload = {
+    "method": "post",
+    "contentType": "application/json",
+    "payload": JSON.stringify({
+      "chat_id": String(chat_id),
+      "text": text,
+      "parse_mode": "HTML"
+    })
+  };
+  UrlFetchApp.fetch(url, { ...payload, muteHttpExceptions: false }); // Lancerà errore se fallisce
+}
+
+function getTelegramFile(file_id) {
+  const getFileUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${file_id}`;
+  const fileResponse = UrlFetchApp.fetch(getFileUrl, { "muteHttpExceptions": false });
+  const fileData = JSON.parse(fileResponse.getContentText());
+  if (!fileData.ok) {
+      throw new Error("Errore API Telegram (getFile): " + fileData.description);
+  }
+  const file_path = fileData.result.file_path;
+  const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${file_path}`;
+  const audioBlob = UrlFetchApp.fetch(downloadUrl).getBlob();
+  return audioBlob;
+}
+
+function callGeminiForJson(audioBlob, mimeType) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const audioBase64 = Utilities.base64Encode(audioBlob.getBytes());
+  const prompt = `
+    Sei un assistente che analizza messaggi vocali e li trasforma in dati strutturati.
+    Analizza l'audio allegato, che contiene una descrizione delle attività svolte da un utente.
+    Estrai OGNI attività menzionata.
+    
+    Il tuo output DEVE essere ESCLUSIVAMENTE un blocco JSON valido.
+    Non includere testo introduttivo, finale o i marcatori \`\`\`json.
+    
+    L'output deve essere un oggetto JSON con una singola chiave "attivita",
+    che contiene un ARRAY di oggetti.
+    
+    Ogni oggetto nell'array deve avere ESATTAMENTE queste 6 chiavi:
+    1. "nome": (stringa) Il titolo dell'attività.
+    2. "azioni": (stringa) Descrizione di cosa è stato fatto.
+    3. "luogo": (stringa) Se specificato, altrimenti stringa vuota "".
+    4. "persone": (stringa) Se specificato, altrimenti stringa vuota "".
+    5. "promemoria": (stringa) Estrai eventuali promemoria o follow-up. Altrimenti stringa vuota "".
+    6. "tempo": (stringa) Stima la durata. Questa colonna è obbligatoria.
+
+    Esempio di output perfetto:
+    {
+      "attivita": [
+        {
+          "nome": "Riunione Progetto X",
+          "azioni": "Discussi i requisiti",
+          "luogo": "Sala riunioni",
+          "persone": "Mario Rossi",
+          "promemoria": "Inviare verbale entro domani",
+          "tempo": "1 ora"
+        }
+      ]
+    }
+  `;
+  const payload = {
+    "contents": [ { "parts": [ { "text": prompt }, { "inline_data": { "mime_type": mimeType, "data": audioBase64 } } ] } ],
+    "generationConfig": { "temperature": 0.1, "maxOutputTokens": 2048 }
+  };
+  const options = {
+    "method": "post",
+    "contentType": "application/json",
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": false 
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const responseText = response.getContentText();
+  const jsonResponse = JSON.parse(responseText);
+  
+  if (!jsonResponse.candidates || !jsonResponse.candidates[0].content || !jsonResponse.candidates[0].content.parts[0].text) {
+      throw new Error("Risposta da Gemini malformata o vuota. Response: " + responseText);
+  }
+  const jsonString = jsonResponse.candidates[0].content.parts[0].text
+                      .replace(/```json/g, "").replace(/```/g, "").trim();
+  return jsonString;
+}
+
+/**
+ * Analizza la stringa JSON e la appende al Google Sheet. (V15.1)
+ * Aggiunge automaticamente la data odierna come prima colonna.
+ */
+function appendJsonToSheet(jsonString) {
+  const sheet = SPREADSHEET.getSheetByName(SHEET_TAB_NAME); 
+  if (!sheet) {
+      throw new Error(`Foglio log "${SHEET_TAB_NAME}" non trovato.`);
+  }
+  
+  let data;
+  try {
+    // Manteniamo questo try-catch specifico per il JSON,
+    // come nella V15, perché è un punto di errore noto.
+    data = JSON.parse(jsonString);
+  } catch (e) {
+    throw new Error("Errore durante il parsing del JSON ricevuto da Gemini. Dati: " + jsonString);
+  }
+  
+  if (!data.attivita || data.attivita.length === 0) {
+    return 0; // Nessun dato da aggiungere
+  }
+
+  // --- MODIFICA 1 ---
+  // Otteniamo la data di oggi, formattata
+  const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy");
+  // --- FINE MODIFICA 1 ---
+
+  // Le chiavi da estrarre dal JSON (l'ordine qui non è importante)
+  const headers = ["nome", "azioni", "luogo", "persone", "promemoria", "tempo"];
+
+  const values = data.attivita.map(row => {
+    // Estrai i valori dal JSON
+    const jsonValues = headers.map(header => {
+      return row[header] || ""; 
+    });
+    
+    // --- MODIFICA 2 ---
+    // Aggiungi la data di oggi all'inizio dell'array della riga
+    jsonValues.unshift(today);
+    // --- FINE MODIFICA 2 ---
+    
+    return jsonValues;
+  });
+
+  // --- MODIFICA 3 ---
+  // Ora scriviamo 7 colonne (1 per la data + 6 dai headers)
+  sheet.getRange(sheet.getLastRow() + 1, 1, values.length, headers.length + 1)
+       .setValues(values);
+  // --- FINE MODIFICA 3 ---
+       
+  return values.length;
+}
