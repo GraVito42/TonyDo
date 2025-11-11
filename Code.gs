@@ -6,8 +6,7 @@ let SHEET_ID;
 let SHEET_TAB_NAME; // Nome del foglio log, es. "Log Attività"
 let SPREADSHEET;
 
-const LOG_SHEET_NAME = "Log Attività"; 
-const QUEUE_SHEET_NAME = "Queue";     
+const LOG_SHEET_NAME = "Log Attività";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const CACHE = CacheService.getScriptCache();
 
@@ -23,129 +22,64 @@ function doPost(e) {
     if (CACHE.get(String(update_id))) {
       return ContentService.createTextOutput(JSON.stringify({ "status": "ok_duplicate" })).setMimeType(ContentService.MimeType.JSON);
     }
-    CACHE.put(String(update_id), 'processed', 600); 
+    CACHE.put(String(update_id), 'processed', 600);
   }
 
   // 2. Gestisci solo messaggi vocali
   if (update.message && update.message.voice) {
     const chat_id = update.message.chat.id;
     const file_id = update.message.voice.file_id;
-    
-    // Caricamento proprietà essenziali
-    const PROPS = PropertiesService.getScriptProperties();
-    const SHEET_ID = PROPS.getProperty("SHEET_ID");
-    const SPREADSHEET = SpreadsheetApp.openById(SHEET_ID);
-    const queueSheet = SPREADSHEET.getSheetByName(QUEUE_SHEET_NAME);
 
-    // 3. Aggiungi alla coda (Se Sheets è lento, questo potrebbe fallire)
-    queueSheet.appendRow([ new Date(), chat_id, file_id, "NEW", "" ]);
+    try {
+      loadScriptProperties();
+
+      const lock = LockService.getScriptLock();
+      if (!lock.tryLock(10000)) {
+        sendTelegramMessage(chat_id, "Sono ancora al lavoro su un altro messaggio. Riprova tra qualche secondo.");
+        return ContentService.createTextOutput(JSON.stringify({ "status": "busy" })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      try {
+        const audioBlob = getTelegramFile(file_id);
+        const jsonString = callGeminiForJson(audioBlob, "audio/ogg");
+
+        if (!jsonString || jsonString.trim() === "") {
+          throw new Error("Gemini ha restituito dati JSON vuoti.");
+        }
+
+        const rowsAdded = appendJsonToSheet(jsonString);
+        const sheetUrl = SPREADSHEET.getUrl();
+
+        if (rowsAdded > 0) {
+          sendTelegramMessage(chat_id, `Fatto! Ho aggiunto ${rowsAdded} attività al tuo log.\nPuoi vederle qui: ${sheetUrl}`);
+        } else {
+          sendTelegramMessage(chat_id, `Ho elaborato il tuo messaggio ma non ho trovato attività da aggiungere.\nPuoi controllare qui: ${sheetUrl}`);
+        }
+      } catch (err) {
+        Logger.log("ERRORE durante l'elaborazione immediata: " + err.message);
+
+        if (err.message.includes("secondi") || err.message.includes("timeout") || err.message.includes("Execution timed out")) {
+          sendTelegramMessage(chat_id, "Errore: l'analisi del tuo audio ha superato il tempo massimo. Prova con un vocale più corto.");
+        } else if (err.message.includes("503") || err.message.includes("UNAVAILABLE") || err.message.includes("overloaded")) {
+          sendTelegramMessage(chat_id, "ℹ️ Gemini è temporaneamente sovraccarico. Riprova tra qualche minuto.");
+        } else {
+          sendTelegramMessage(chat_id, `Si è verificato un errore durante l'analisi: ${err.message}`);
+        }
+      } finally {
+        lock.releaseLock();
+      }
+    } catch (outerErr) {
+      Logger.log("ERRORE GRAVE in doPost: " + outerErr.toString());
+    }
 
   } else if (update.message && update.message.text) {
     // Rispondi ai messaggi di testo
     if(!TELEGRAM_TOKEN) loadScriptProperties();
     sendTelegramMessage(update.message.chat.id, "Non ho capito. Inviami solo messaggi vocali.");
   }
-  
+
   // 4. Restituisci 200 OK a Telegram
-  return ContentService.createTextOutput(JSON.stringify({ "status": "ok_queued" })).setMimeType(ContentService.MimeType.JSON);
-}
-
-
-// --- FUNZIONE WORKER (LENTA) - SENZA TRY/CATCH ---
-
-function processQueue() {
-  // --- 1. RE-INTRODUCIAMO IL LOCKSERVICE ---
-  // Tenta di ottenere un blocco per 10 secondi. Se fallisce, 
-  // significa che un altro operaio è già al lavoro.
-  const LOCK = LockService.getScriptLock();
-  if (!LOCK.tryLock(10000)) {
-    Logger.log("Esecuzione saltata: processo già in corso (Lock attivo).");
-    return;
-  }
-
-  try {
-    // 2. Carica le proprietà
-    loadScriptProperties();
-    const queueSheet = SPREADSHEET.getSheetByName(QUEUE_SHEET_NAME);
-    const dataRange = queueSheet.getDataRange();
-    const values = dataRange.getValues();
-
-    // 3. Cerca il primo task "NEW"
-    for (let i = 1; i < values.length; i++) {
-      const row = values[i];
-      const stato = row[3]; 
-
-      if (stato === "NEW") {
-        const rowNum = i + 1; 
-        const chat_id = row[1];
-        const file_id = row[2];
-
-        // --- 2. RE-INTRODUCIAMO IL TRY/CATCH (ESSENZIALE) ---
-        // Questo cattura gli errori (Timeout, 503, 400) e 
-        // impedisce che la riga resti bloccata in "PROCESSING".
-        try {
-          queueSheet.getRange(rowNum, 4).setValue("PROCESSING");
-          
-          Logger.log(`Processing riga ${rowNum}: chat_id ${chat_id}`);
-          const audioBlob = getTelegramFile(file_id);
-          const jsonString = callGeminiForJson(audioBlob, "audio/ogg");
-          
-          if (!jsonString || jsonString.trim() === "") {
-             throw new Error("Gemini ha restituito dati JSON vuoti.");
-          }
-
-          // Usiamo la V15.1 che aggiunge la data
-          const rowsAdded = appendJsonToSheet(jsonString);
-          
-          queueSheet.getRange(rowNum, 4).setValue("DONE");
-          queueSheet.getRange(rowNum, 5).setValue(`Aggiunte ${rowsAdded} righe.`);
-          
-          const sheetUrl = SPREADSHEET.getUrl();
-          sendTelegramMessage(chat_id, `Fatto! Ho aggiunto ${rowsAdded} attività al tuo log.\nPuoi vederle qui: ${sheetUrl}`);
-          
-          break; // Processa solo una riga alla volta
-
-        } catch (err) {
-          // --- GESTIONE ERRORI INTELLIGENTE ---
-          const errorMessage = err.message;
-          Logger.log(`ERRORE riga ${rowNum}: ${errorMessage}`);
-          
-          // Se l'errore è un Timeout di Google (che appare come "superato il tempo massimo")
-          if (errorMessage.includes("secondi") || errorMessage.includes("timeout") || errorMessage.includes("Execution timed out")) {
-              queueSheet.getRange(rowNum, 4).setValue("ERROR");
-              queueSheet.getRange(rowNum, 5).setValue("Timeout 6 minuti. Il file audio è troppo lungo per Gemini?");
-              sendTelegramMessage(chat_id, `Errore: L'analisi del tuo audio ha superato il tempo massimo di 6 minuti. Prova con un vocale più corto.`);
-          
-          } else if (errorMessage.includes("503") || errorMessage.includes("UNAVAILABLE") || errorMessage.includes("overloaded")) {
-            // Gemini sovraccarico, riprova
-            const noteCell = queueSheet.getRange(rowNum, 5);
-            const currentNote = noteCell.getValue();
-            const retryMessage = "In attesa (Gemini sovraccarico). Riprovo tra 1 min.";
-            if (currentNote !== retryMessage) {
-              sendTelegramMessage(chat_id, "ℹ️ Gemini (l'AI) è temporaneamente sovraccarico. Il tuo audio è in attesa, riproverò automaticamente tra 1 minuto.");
-            }
-            queueSheet.getRange(rowNum, 4).setValue("NEW"); 
-            noteCell.setValue(retryMessage);
-          
-          } else {
-            // Errore permanente (400, 500, ecc.)
-            queueSheet.getRange(rowNum, 4).setValue("ERROR");
-            queueSheet.getRange(rowNum, 5).setValue(errorMessage);
-            sendTelegramMessage(chat_id, `Si è verificato un errore permanente durante l'analisi: ${errorMessage}`);
-          }
-          // --- FINE GESTIONE ERRORI ---
-        }
-      }
-    }
-  } catch (err_esterno) {
-    // Questo cattura solo errori catastrofici (es. Foglio 'Queue' non trovato)
-    Logger.log("ERRORE GRAVE in processQueue: " + err_esterno.toString());
-  } finally {
-    // --- 3. RILASCIA IL LOCK ---
-    // Questo è fondamentale: rilascia il blocco alla fine, 
-    // sia che lo script abbia successo o fallisca.
-    LOCK.releaseLock();
-  }
+  return ContentService.createTextOutput(JSON.stringify({ "status": "ok_processed" })).setMimeType(ContentService.MimeType.JSON);
 }
 
 
