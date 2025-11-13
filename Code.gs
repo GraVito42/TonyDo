@@ -9,17 +9,21 @@ let SPREADSHEET;
 const LOG_SHEET_NAME = "Log Attività";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const CACHE = CacheService.getScriptCache();
+const UPDATE_STATUS_PREFIX = 'update_status_';
+const UPDATE_PROCESSING_MAX_AGE = 7 * 60 * 1000; // 7 minuti di attesa massima prima di riprovare
+const UPDATE_DONE_RETENTION_MS = 12 * 60 * 60 * 1000; // mantieni lo stato "done" per 12 ore
 
 // --- FUNZIONE WEBHOOK (VELOCE) - SENZA TRY/CATCH ---
 
 function doPost(e) {
 
   const update = JSON.parse(e.postData.contents);
+  pruneOldUpdateStatuses();
 
   // 1. Controllo Idempotenza (Fondamentale)
   const update_id = update.update_id;
   if (update_id) {
-    if (CACHE.get(String(update_id))) {
+    if (shouldSkipUpdate(update_id)) {
       return ContentService.createTextOutput(JSON.stringify({ "status": "ok_duplicate" })).setMimeType(ContentService.MimeType.JSON);
     }
     CACHE.put(String(update_id), 'processed', 600);
