@@ -26,28 +26,20 @@ function doPost(e) {
     if (shouldSkipUpdate(update_id)) {
       return ContentService.createTextOutput(JSON.stringify({ "status": "ok_duplicate" })).setMimeType(ContentService.MimeType.JSON);
     }
+    CACHE.put(String(update_id), 'processed', 600);
   }
 
   // 2. Gestisci solo messaggi vocali
   if (update.message && update.message.voice) {
     const chat_id = update.message.chat.id;
     const file_id = update.message.voice.file_id;
-    let markedProcessing = false;
 
     try {
       loadScriptProperties();
 
-      if (update_id) {
-        markUpdateProcessing(update_id);
-        markedProcessing = true;
-      }
-
       const lock = LockService.getScriptLock();
       if (!lock.tryLock(10000)) {
         sendTelegramMessage(chat_id, "Sono ancora al lavoro su un altro messaggio. Riprova tra qualche secondo.");
-        if (update_id && markedProcessing) {
-          clearUpdateStatus(update_id);
-        }
         return ContentService.createTextOutput(JSON.stringify({ "status": "busy" })).setMimeType(ContentService.MimeType.JSON);
       }
 
@@ -67,11 +59,6 @@ function doPost(e) {
         } else {
           sendTelegramMessage(chat_id, `Ho elaborato il tuo messaggio ma non ho trovato attività da aggiungere.\nPuoi controllare qui: ${sheetUrl}`);
         }
-
-        if (update_id) {
-          markUpdateDone(update_id);
-          markedProcessing = false;
-        }
       } catch (err) {
         Logger.log("ERRORE durante l'elaborazione immediata: " + err.message);
 
@@ -81,10 +68,6 @@ function doPost(e) {
           sendTelegramMessage(chat_id, "ℹ️ Gemini è temporaneamente sovraccarico. Riprova tra qualche minuto.");
         } else {
           sendTelegramMessage(chat_id, `Si è verificato un errore durante l'analisi: ${err.message}`);
-        }
-
-        if (update_id && markedProcessing) {
-          clearUpdateStatus(update_id);
         }
       } finally {
         lock.releaseLock();
@@ -97,122 +80,10 @@ function doPost(e) {
     // Rispondi ai messaggi di testo
     if(!TELEGRAM_TOKEN) loadScriptProperties();
     sendTelegramMessage(update.message.chat.id, "Non ho capito. Inviami solo messaggi vocali.");
-    if (update_id) {
-      markUpdateDone(update_id);
-    }
-  } else if (update_id) {
-    markUpdateDone(update_id);
   }
 
   // 4. Restituisci 200 OK a Telegram
   return ContentService.createTextOutput(JSON.stringify({ "status": "ok_processed" })).setMimeType(ContentService.MimeType.JSON);
-}
-
-function shouldSkipUpdate(updateId) {
-  if (!updateId) {
-    return false;
-  }
-  const status = getUpdateStatus(updateId);
-  if (!status) {
-    return false;
-  }
-
-  const age = Date.now() - status.ts;
-  if (status.status === 'done') {
-    return true;
-  }
-  if (status.status === 'processing') {
-    if (age < UPDATE_PROCESSING_MAX_AGE) {
-      return true;
-    }
-    clearUpdateStatus(updateId);
-  }
-  return false;
-}
-
-function markUpdateProcessing(updateId) {
-  persistUpdateStatus(updateId, 'processing');
-}
-
-function markUpdateDone(updateId) {
-  persistUpdateStatus(updateId, 'done');
-}
-
-function clearUpdateStatus(updateId) {
-  if (!updateId) {
-    return;
-  }
-  const key = getUpdateStatusKey(updateId);
-  PropertiesService.getScriptProperties().deleteProperty(key);
-  CACHE.remove(key);
-}
-
-function getUpdateStatus(updateId) {
-  if (!updateId) {
-    return null;
-  }
-  const key = getUpdateStatusKey(updateId);
-  const cached = CACHE.get(key);
-  if (cached) {
-    try {
-      return JSON.parse(cached);
-    } catch (err) {
-      CACHE.remove(key);
-    }
-  }
-  const props = PropertiesService.getScriptProperties();
-  const raw = props.getProperty(key);
-  if (!raw) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    CACHE.put(key, raw, 600);
-    return parsed;
-  } catch (err) {
-    props.deleteProperty(key);
-    return null;
-  }
-}
-
-function persistUpdateStatus(updateId, status) {
-  if (!updateId) {
-    return;
-  }
-  const key = getUpdateStatusKey(updateId);
-  const value = JSON.stringify({ status, ts: Date.now() });
-  PropertiesService.getScriptProperties().setProperty(key, value);
-  CACHE.put(key, value, 600);
-}
-
-function pruneOldUpdateStatuses() {
-  const props = PropertiesService.getScriptProperties();
-  const allProps = props.getProperties();
-  if (!allProps) {
-    return;
-  }
-  const now = Date.now();
-  Object.keys(allProps).forEach(key => {
-    if (!key.startsWith(UPDATE_STATUS_PREFIX)) {
-      return;
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(allProps[key]);
-    } catch (err) {
-      props.deleteProperty(key);
-      CACHE.remove(key);
-      return;
-    }
-    if (now - parsed.ts > UPDATE_DONE_RETENTION_MS) {
-      props.deleteProperty(key);
-      CACHE.remove(key);
-    }
-  });
-}
-
-function getUpdateStatusKey(updateId) {
-  return `${UPDATE_STATUS_PREFIX}${updateId}`;
 }
 
 
